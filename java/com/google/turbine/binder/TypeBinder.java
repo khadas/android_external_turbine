@@ -17,6 +17,7 @@
 package com.google.turbine.binder;
 
 import static com.google.common.collect.Iterables.getLast;
+import static com.google.common.collect.Iterables.getOnlyElement;
 import static java.util.Objects.requireNonNull;
 
 import com.google.common.base.Joiner;
@@ -63,6 +64,7 @@ import com.google.turbine.types.Deannotate;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -204,7 +206,8 @@ public class TypeBinder {
         break;
       case CLASS:
         if (base.decl().xtnds().isPresent()) {
-          superClassType = bindClassTy(bindingScope, base.decl().xtnds().get());
+          superClassType =
+              checkClassType(bindingScope, base.decl().xtnds().get(), /* expectInterface= */ false);
         } else if (owner.equals(ClassSymbol.OBJECT)) {
           // java.lang.Object doesn't have a superclass
           superClassType = null;
@@ -226,7 +229,7 @@ public class TypeBinder {
     }
 
     for (Tree.ClassTy i : base.decl().impls()) {
-      interfaceTypes.add(bindClassTy(bindingScope, i));
+      interfaceTypes.add(checkClassType(bindingScope, i, /* expectInterface= */ true));
     }
 
     ImmutableList.Builder<ClassSymbol> permits = ImmutableList.builder();
@@ -248,12 +251,16 @@ public class TypeBinder {
 
     ImmutableList<RecordComponentInfo> components = bindComponents(scope, base.decl().components());
 
-    ImmutableList.Builder<MethodInfo> methods =
-        ImmutableList.<MethodInfo>builder()
-            .addAll(syntheticMethods(syntheticMethods, components))
-            .addAll(bindMethods(scope, base.decl().members(), components));
+    List<MethodInfo> boundMethods = bindMethods(scope, base.decl().members(), components);
+    ImmutableList<MethodInfo> methods;
     if (base.kind().equals(TurbineTyKind.RECORD)) {
-      methods.addAll(syntheticRecordMethods(syntheticMethods, components));
+      methods = recordMethods(syntheticMethods, components, boundMethods);
+    } else {
+      methods =
+          ImmutableList.<MethodInfo>builder()
+              .addAll(syntheticMethods(syntheticMethods))
+              .addAll(boundMethods)
+              .build();
     }
 
     ImmutableList<FieldInfo> fields = bindFields(scope, base.decl().members());
@@ -265,7 +272,7 @@ public class TypeBinder {
         typeParameterTypes,
         base.access(),
         components,
-        methods.build(),
+        methods,
         fields,
         base.owner(),
         base.kind(),
@@ -278,6 +285,193 @@ public class TypeBinder {
         annotations,
         base.source(),
         base.decl());
+  }
+
+  private ImmutableList<MethodInfo> recordMethods(
+      SyntheticMethods syntheticMethods,
+      ImmutableList<RecordComponentInfo> components,
+      List<MethodInfo> boundMethods) {
+    List<MethodInfo> boundConstructors = new ArrayList<>();
+    List<MethodInfo> boundNonConstructors = new ArrayList<>();
+    boolean hasToString = false;
+    boolean hasEquals = false;
+    boolean hasHashCode = false;
+    boolean hasPrimaryConstructor = false;
+    for (MethodInfo m : boundMethods) {
+      if (m.name().equals("<init>")) {
+        if (isPrimaryConstructor(m, components)) {
+          hasPrimaryConstructor = true;
+        }
+        boundConstructors.add(m);
+      } else {
+        switch (m.name()) {
+          case "toString":
+            hasToString = m.parameters().isEmpty();
+            break;
+          case "equals":
+            hasEquals =
+                m.parameters().size() == 1
+                    && hasSameErasure(getOnlyElement(m.parameters()).type(), Type.ClassTy.OBJECT);
+            break;
+          case "hashCode":
+            hasHashCode = m.parameters().isEmpty();
+            break;
+          default: // fall out
+        }
+        boundNonConstructors.add(m);
+      }
+    }
+    ImmutableList.Builder<MethodInfo> methods = ImmutableList.builder();
+    methods.addAll(boundConstructors);
+    if (!hasPrimaryConstructor) {
+      methods.add(defaultRecordConstructor(syntheticMethods, components));
+    }
+    methods.addAll(boundNonConstructors);
+    if (!hasToString) {
+      MethodSymbol toStringMethod = syntheticMethods.create(owner, "toString");
+      methods.add(
+          new MethodInfo(
+              toStringMethod,
+              ImmutableMap.of(),
+              Type.ClassTy.STRING,
+              ImmutableList.of(),
+              ImmutableList.of(),
+              TurbineFlag.ACC_PUBLIC | TurbineFlag.ACC_FINAL,
+              null,
+              null,
+              ImmutableList.of(),
+              null));
+    }
+    if (!hasHashCode) {
+      MethodSymbol hashCodeMethod = syntheticMethods.create(owner, "hashCode");
+      methods.add(
+          new MethodInfo(
+              hashCodeMethod,
+              ImmutableMap.of(),
+              Type.PrimTy.create(TurbineConstantTypeKind.INT, ImmutableList.of()),
+              ImmutableList.of(),
+              ImmutableList.of(),
+              TurbineFlag.ACC_PUBLIC | TurbineFlag.ACC_FINAL,
+              null,
+              null,
+              ImmutableList.of(),
+              null));
+    }
+    if (!hasEquals) {
+      MethodSymbol equalsMethod = syntheticMethods.create(owner, "equals");
+      methods.add(
+          new MethodInfo(
+              equalsMethod,
+              ImmutableMap.of(),
+              Type.PrimTy.create(TurbineConstantTypeKind.BOOLEAN, ImmutableList.of()),
+              ImmutableList.of(
+                  new ParamInfo(
+                      new ParamSymbol(equalsMethod, "other"),
+                      Type.ClassTy.OBJECT,
+                      ImmutableList.of(),
+                      TurbineFlag.ACC_MANDATED)),
+              ImmutableList.of(),
+              TurbineFlag.ACC_PUBLIC | TurbineFlag.ACC_FINAL,
+              null,
+              null,
+              ImmutableList.of(),
+              null));
+    }
+    for (RecordComponentInfo c : components) {
+      MethodSymbol componentMethod = syntheticMethods.create(owner, c.name());
+      methods.add(
+          new MethodInfo(
+              componentMethod,
+              ImmutableMap.of(),
+              c.type(),
+              ImmutableList.of(),
+              ImmutableList.of(),
+              TurbineFlag.ACC_PUBLIC,
+              null,
+              null,
+              c.annotations(),
+              null));
+    }
+    return methods.build();
+  }
+
+  private MethodInfo defaultRecordConstructor(
+      SyntheticMethods syntheticMethods, ImmutableList<RecordComponentInfo> components) {
+    MethodSymbol symbol = syntheticMethods.create(owner, "<init>");
+    ImmutableList.Builder<ParamInfo> params = ImmutableList.builder();
+    for (RecordComponentInfo component : components) {
+      params.add(
+          new ParamInfo(
+              new ParamSymbol(symbol, component.name()),
+              component.type(),
+              component.annotations(),
+              component.access()));
+    }
+    return syntheticConstructor(
+        symbol, params.build(), TurbineVisibility.fromAccess(base.access()));
+  }
+
+  private boolean isPrimaryConstructor(
+      MethodInfo m, ImmutableList<RecordComponentInfo> components) {
+    if (m.parameters().size() != components.size()) {
+      return false;
+    }
+    for (int i = 0; i < m.parameters().size(); i++) {
+      if (!hasSameErasure(m.parameters().get(i).type(), components.get(i).type())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private static boolean hasSameErasure(Type a, Type b) {
+    switch (a.tyKind()) {
+      case PRIM_TY:
+        return b.tyKind() == Type.TyKind.PRIM_TY
+            && ((Type.PrimTy) a).primkind() == ((Type.PrimTy) b).primkind();
+      case CLASS_TY:
+        return b.tyKind() == Type.TyKind.CLASS_TY
+            && ((Type.ClassTy) a).sym().equals(((Type.ClassTy) b).sym());
+      case ARRAY_TY:
+        return b.tyKind() == Type.TyKind.ARRAY_TY
+            && hasSameErasure(((Type.ArrayTy) a).elementType(), ((Type.ArrayTy) b).elementType());
+      case TY_VAR:
+        return b.tyKind() == Type.TyKind.TY_VAR
+            && ((Type.TyVar) a).sym().equals(((Type.TyVar) b).sym());
+      case ERROR_TY:
+        return false;
+      case WILD_TY:
+      case INTERSECTION_TY:
+      case METHOD_TY:
+      case NONE_TY:
+      case VOID_TY:
+        // fall out: impossible method parameter types
+    }
+    throw new AssertionError(a.tyKind());
+  }
+
+  private Type checkClassType(CompoundScope scope, ClassTy tree, boolean expectInterface) {
+    Type type = bindClassTy(scope, tree);
+    if (type.tyKind().equals(Type.TyKind.ERROR_TY)) {
+      return type;
+    }
+    HeaderBoundClass info = env.getNonNull(((Type.ClassTy) type).sym());
+    boolean isInterface;
+    switch (info.kind()) {
+      case INTERFACE:
+      case ANNOTATION:
+        isInterface = true;
+        break;
+      default:
+        isInterface = false;
+        break;
+    }
+    if (expectInterface != isInterface) {
+      log.error(
+          tree.position(),
+          expectInterface ? ErrorKind.EXPECTED_INTERFACE : ErrorKind.UNEXPECTED_INTERFACE);
+    }
+    return type;
   }
 
   /**
@@ -315,37 +509,15 @@ public class TypeBinder {
   }
 
   /** Collect synthetic and implicit methods, including default constructors and enum methods. */
-  ImmutableList<MethodInfo> syntheticMethods(
-      SyntheticMethods syntheticMethods, ImmutableList<RecordComponentInfo> components) {
+  ImmutableList<MethodInfo> syntheticMethods(SyntheticMethods syntheticMethods) {
     switch (base.kind()) {
       case CLASS:
         return maybeDefaultConstructor(syntheticMethods);
-      case RECORD:
-        return maybeDefaultRecordConstructor(syntheticMethods, components);
       case ENUM:
         return syntheticEnumMethods(syntheticMethods);
       default:
         return ImmutableList.of();
     }
-  }
-
-  private ImmutableList<MethodInfo> maybeDefaultRecordConstructor(
-      SyntheticMethods syntheticMethods, ImmutableList<RecordComponentInfo> components) {
-    if (hasConstructor()) {
-      return ImmutableList.of();
-    }
-    MethodSymbol symbol = syntheticMethods.create(owner, "<init>");
-    ImmutableList.Builder<ParamInfo> params = ImmutableList.builder();
-    for (RecordComponentInfo component : components) {
-      params.add(
-          new ParamInfo(
-              new ParamSymbol(symbol, component.name()),
-              component.type(),
-              component.annotations(),
-              component.access()));
-    }
-    return ImmutableList.of(
-        syntheticConstructor(symbol, params.build(), TurbineVisibility.fromAccess(base.access())));
   }
 
   private ImmutableList<MethodInfo> maybeDefaultConstructor(SyntheticMethods syntheticMethods) {
@@ -466,71 +638,6 @@ public class TypeBinder {
     return methods.build();
   }
 
-  private ImmutableList<MethodInfo> syntheticRecordMethods(
-      SyntheticMethods syntheticMethods, ImmutableList<RecordComponentInfo> components) {
-    ImmutableList.Builder<MethodInfo> methods = ImmutableList.builder();
-    MethodSymbol toStringMethod = syntheticMethods.create(owner, "toString");
-    methods.add(
-        new MethodInfo(
-            toStringMethod,
-            ImmutableMap.of(),
-            Type.ClassTy.STRING,
-            ImmutableList.of(),
-            ImmutableList.of(),
-            TurbineFlag.ACC_PUBLIC | TurbineFlag.ACC_FINAL,
-            null,
-            null,
-            ImmutableList.of(),
-            null));
-    MethodSymbol hashCodeMethod = syntheticMethods.create(owner, "hashCode");
-    methods.add(
-        new MethodInfo(
-            hashCodeMethod,
-            ImmutableMap.of(),
-            Type.PrimTy.create(TurbineConstantTypeKind.INT, ImmutableList.of()),
-            ImmutableList.of(),
-            ImmutableList.of(),
-            TurbineFlag.ACC_PUBLIC | TurbineFlag.ACC_FINAL,
-            null,
-            null,
-            ImmutableList.of(),
-            null));
-    MethodSymbol equalsMethod = syntheticMethods.create(owner, "equals");
-    methods.add(
-        new MethodInfo(
-            equalsMethod,
-            ImmutableMap.of(),
-            Type.PrimTy.create(TurbineConstantTypeKind.BOOLEAN, ImmutableList.of()),
-            ImmutableList.of(
-                new ParamInfo(
-                    new ParamSymbol(equalsMethod, "other"),
-                    Type.ClassTy.OBJECT,
-                    ImmutableList.of(),
-                    TurbineFlag.ACC_MANDATED)),
-            ImmutableList.of(),
-            TurbineFlag.ACC_PUBLIC | TurbineFlag.ACC_FINAL,
-            null,
-            null,
-            ImmutableList.of(),
-            null));
-    for (RecordComponentInfo c : components) {
-      MethodSymbol componentMethod = syntheticMethods.create(owner, c.name());
-      methods.add(
-          new MethodInfo(
-              componentMethod,
-              ImmutableMap.of(),
-              c.type(),
-              ImmutableList.of(),
-              ImmutableList.of(),
-              TurbineFlag.ACC_PUBLIC,
-              null,
-              null,
-              c.annotations(),
-              null));
-    }
-    return methods.build();
-  }
-
   private boolean hasConstructor() {
     for (Tree m : base.decl().members()) {
       if (m.kind() != Kind.METH_DECL) {
@@ -546,7 +653,7 @@ public class TypeBinder {
   /** Bind type parameter types. */
   private ImmutableMap<TyVarSymbol, TyVarInfo> bindTyParams(
       ImmutableList<Tree.TyParam> trees, CompoundScope scope, Map<String, TyVarSymbol> symbols) {
-    ImmutableMap.Builder<TyVarSymbol, TyVarInfo> result = ImmutableMap.builder();
+    LinkedHashMap<TyVarSymbol, TyVarInfo> result = new LinkedHashMap<>();
     for (Tree.TyParam tree : trees) {
       // `symbols` is constructed to guarantee the requireNonNull call is safe.
       TyVarSymbol sym = requireNonNull(symbols.get(tree.name().value()));
@@ -555,12 +662,16 @@ public class TypeBinder {
         bounds.add(bindTy(scope, bound));
       }
       ImmutableList<AnnoInfo> annotations = bindAnnotations(scope, tree.annos());
-      result.put(
-          sym,
-          new TyVarInfo(
-              IntersectionTy.create(bounds.build()), /* lowerBound= */ null, annotations));
+      TyVarInfo existing =
+          result.putIfAbsent(
+              sym,
+              new TyVarInfo(
+                  IntersectionTy.create(bounds.build()), /* lowerBound= */ null, annotations));
+      if (existing != null) {
+        log.error(tree.position(), ErrorKind.DUPLICATE_DECLARATION, tree.name());
+      }
     }
-    return result.buildOrThrow();
+    return ImmutableMap.copyOf(result);
   }
 
   private List<MethodInfo> bindMethods(
@@ -588,7 +699,8 @@ public class TypeBinder {
       for (Tree.TyParam pt : t.typarams()) {
         builder.put(pt.name().value(), new TyVarSymbol(sym, pt.name().value()));
       }
-      typeParameters = builder.buildOrThrow();
+      // errors for duplicates are reported in bindTyParams
+      typeParameters = builder.buildKeepingLast();
     }
 
     // type parameters can refer to each other in f-bounds, so update the scope first
