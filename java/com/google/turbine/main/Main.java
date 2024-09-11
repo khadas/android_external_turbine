@@ -18,6 +18,7 @@ package com.google.turbine.main;
 
 import static com.google.common.base.StandardSystemProperty.JAVA_SPECIFICATION_VERSION;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.Objects.requireNonNull;
 
 import com.google.auto.value.AutoValue;
 import com.google.common.collect.ImmutableList;
@@ -195,13 +196,23 @@ public final class Main {
       // TODO(cushon): parallelize
       Lowered lowered =
           Lower.lowerAll(
-              options.languageVersion(), bound.units(), bound.modules(), bound.classPathEnv());
+              Lower.LowerOptions.builder()
+                  .languageVersion(options.languageVersion())
+                  .emitPrivateFields(options.javacOpts().contains("-XDturbine.emitPrivateFields"))
+                  .build(),
+              bound.units(),
+              bound.modules(),
+              bound.classPathEnv());
 
       if (options.outputDeps().isPresent()) {
         DepsProto.Dependencies deps =
             Dependencies.collectDeps(options.targetLabel(), bootclasspath, bound, lowered);
         Path path = Paths.get(options.outputDeps().get());
-        Files.createDirectories(path.getParent());
+        /*
+         * TODO: cpovirk - Consider checking outputDeps for validity earlier so that anyone who
+         * `--output_deps=/` or similar will get a proper error instead of NPE.
+         */
+        Files.createDirectories(requireNonNull(path.getParent()));
         try (OutputStream os = new BufferedOutputStream(Files.newOutputStream(path))) {
           deps.writeTo(os);
         }
@@ -267,7 +278,7 @@ public final class Main {
                 /* processorPath= */ options.processorPath(),
                 /* builtinProcessors= */ options.builtinProcessors())),
         bootclasspath,
-        /* moduleVersion=*/ Optional.empty());
+        /* moduleVersion= */ Optional.empty());
   }
 
   private static void usage(TurbineOptions options) {
@@ -314,17 +325,24 @@ public final class Main {
   /** Parse all source files and source jars. */
   // TODO(cushon): parallelize
   private static ImmutableList<CompUnit> parseAll(TurbineOptions options) throws IOException {
+    return parseAll(options.sources(), options.sourceJars());
+  }
+
+  static ImmutableList<CompUnit> parseAll(Iterable<String> sources, Iterable<String> sourceJars)
+      throws IOException {
     ImmutableList.Builder<CompUnit> units = ImmutableList.builder();
-    for (String source : options.sources()) {
+    for (String source : sources) {
       Path path = Paths.get(source);
       units.add(Parser.parse(new SourceFile(source, MoreFiles.asCharSource(path, UTF_8).read())));
     }
-    for (String sourceJar : options.sourceJars()) {
-      for (Zip.Entry ze : new Zip.ZipIterable(Paths.get(sourceJar))) {
-        if (ze.name().endsWith(".java")) {
-          String name = ze.name();
-          String source = new String(ze.data(), UTF_8);
-          units.add(Parser.parse(new SourceFile(name, source)));
+    for (String sourceJar : sourceJars) {
+      try (Zip.ZipIterable iterable = new Zip.ZipIterable(Paths.get(sourceJar))) {
+        for (Zip.Entry ze : iterable) {
+          if (ze.name().endsWith(".java")) {
+            String name = ze.name();
+            String source = new String(ze.data(), UTF_8);
+            units.add(Parser.parse(new SourceFile(name, source)));
+          }
         }
       }
     }
@@ -342,7 +360,8 @@ public final class Main {
     if (Files.isDirectory(path)) {
       for (SourceFile source : generatedSources.values()) {
         Path to = path.resolve(source.path());
-        Files.createDirectories(to.getParent());
+        // TODO: cpovirk - Consider checking gensrcOutput, similar to outputDeps.
+        Files.createDirectories(requireNonNull(to.getParent()));
         Files.writeString(to, source.source());
       }
       return;
@@ -367,7 +386,8 @@ public final class Main {
     if (Files.isDirectory(path)) {
       for (Map.Entry<String, byte[]> resource : generatedResources.entrySet()) {
         Path to = path.resolve(resource.getKey());
-        Files.createDirectories(to.getParent());
+        // TODO: cpovirk - Consider checking resourceOutput, similar to outputDeps.
+        Files.createDirectories(requireNonNull(to.getParent()));
         Files.write(to, resource.getValue());
       }
       return;
